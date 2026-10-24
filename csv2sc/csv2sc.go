@@ -1,5 +1,5 @@
 // csv2sc.go — Converts CSV files to the sc (Spreadsheet Calculator) format,
-// and vice versa.
+// and vice versa. Also provides a headless formula evaluator.
 //
 // Build:
 //   go build -ldflags="-s -w" -o csv2sc csv2sc.go
@@ -20,12 +20,21 @@
 //   --csv       Convert an sc file back to CSV
 //   --calc      With --csv, evaluate formulas and output computed values
 //
+// Options (headless formula evaluator):
+//   --eval EXPR Evaluate a single expression or cell (e.g., "=A1+B2",
+//               "=@sum(A1:A10)") and print the result to stdout.
+//               The file is loaded first (either .sc or .csv, detected
+//               by extension), so cell references are resolved against
+//               the spreadsheet. Requires a file argument.
+//   -p N        Number of decimal places for --eval and --calc output
+//               (default: 2).
+//
 //   -h          Show help
 //
 // Fields starting with '=' are converted to formulas (let). Example:
 //   =B2*C2   ->   let D2 = B2*C2
 //
-// Formulas in --calc mode support:
+// Formulas in --calc and --eval modes support:
 //   - numbers, cell addresses (A1, B23), cell ranges (A1:A3)
 //   - operators + - * / ** and parentheses
 //   - @sum, @avg, @max, @min with one or more arguments (cells or ranges)
@@ -37,6 +46,9 @@
 //   csv2sc -n -t data.csv > data.sc
 //   csv2sc --csv data.sc > data.csv
 //   csv2sc --csv --calc data.sc > computed.csv
+//   csv2sc --eval "=A1+B2" data.sc
+//   csv2sc --eval "=@sum(A1:A10)" -p 4 data.csv
+
 package main
 
 import (
@@ -47,6 +59,7 @@ import (
 	"io"
 	"math/big"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -63,6 +76,8 @@ func main() {
 		forceText = flag.Bool("t", false, "force all fields as text (leftstring)")
 		toCSV     = flag.Bool("csv", false, "convert an sc file back to CSV")
 		calc      = flag.Bool("calc", false, "with --csv, evaluate formulas and output computed values")
+		evalExpr  = flag.String("eval", "", "evaluate a single expression or cell and print the result")
+		precision = flag.Int("p", 2, "number of decimal places for --eval and --calc output")
 		showHelp  = flag.Bool("h", false, "show help")
 	)
 
@@ -72,6 +87,19 @@ func main() {
 	if *showHelp {
 		usage()
 		os.Exit(0)
+	}
+
+	// --eval mode: load the file (sc or csv), evaluate the expression, print.
+	if *evalExpr != "" {
+		if flag.NArg() == 0 {
+			fmt.Fprintf(os.Stderr, "csv2sc: --eval requires a file argument\n")
+			os.Exit(1)
+		}
+		if err := evalExpression(flag.Arg(0), *evalExpr, *precision); err != nil {
+			fmt.Fprintf(os.Stderr, "csv2sc: %v\n", err)
+			os.Exit(1)
+		}
+		return
 	}
 
 	switch *align {
@@ -103,7 +131,7 @@ func main() {
 	}
 
 	if *toCSV {
-		if err := scToCSV(input, os.Stdout, r, *calc); err != nil {
+		if err := scToCSV(input, os.Stdout, r, *calc, *precision); err != nil {
 			fmt.Fprintf(os.Stderr, "csv2sc: %v\n", err)
 			os.Exit(1)
 		}
@@ -121,6 +149,8 @@ func usage() {
 
 Converts a CSV file into the sc (Spreadsheet Calculator) format,
 or, with --csv, converts an sc file back to CSV.
+With --eval, evaluates a single expression or cell against a file
+(either .sc or .csv, detected by extension).
 
 Options (CSV -> sc):
   -d CHAR    Field delimiter (default: ','). Use '\t' for tab.
@@ -135,17 +165,25 @@ Options (sc -> CSV):
   --csv      Convert an sc file back to CSV.
   --calc     With --csv, evaluate formulas and output computed values.
 
+Options (headless formula evaluator):
+  --eval EXPR Evaluate a single expression or cell (e.g., "=A1+B2",
+             "=@sum(A1:A10)") and print the result to stdout.
+             The file is loaded first, so cell references are resolved
+             against the spreadsheet. Requires a file argument.
+  -p N       Number of decimal places for --eval and --calc output
+             (default: 2).
+
   -h         Show this help.
 
 Fields starting with '=' are converted to formulas (let).
 Example:  =B2*C2   becomes   let D2 = B2*C2
 
-Formulas in --calc mode support:
+Formulas in --calc and --eval modes support:
   - numbers, cell addresses (A1, B23), cell ranges (A1:A3)
   - operators + - * / ** and parentheses
   - @sum, @avg, @max, @min with one or more arguments (cells or ranges)
 
-If no file is given, reads from standard input.
+If no file is given (except with --eval), reads from standard input.
 Output is written to standard output.`)
 }
 
@@ -249,7 +287,7 @@ type cellCmd struct {
 var scCmdRx = regexp.MustCompile(`^(let|leftstring|rightstring|label)\s+([A-Z]+\d+)\s*=\s*(.*)$`)
 var scAddrRx = regexp.MustCompile(`^([A-Z]+)(\d+)$`)
 
-func scToCSV(r io.Reader, w io.Writer, delim rune, calc bool) error {
+func scToCSV(r io.Reader, w io.Writer, delim rune, calc bool, precision int) error {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 
@@ -317,7 +355,7 @@ func scToCSV(r io.Reader, w io.Writer, delim rune, calc bool) error {
 				if err != nil {
 					values[c.addr] = "#ERR"
 				} else {
-					values[c.addr] = rat.FloatString(2)
+					values[c.addr] = rat.FloatString(precision)
 				}
 			}
 		}
@@ -384,13 +422,157 @@ func unescapeString(s string) string {
 }
 
 // ===========================================================================
-// Formula evaluator (for --calc)
+// Formula evaluator (for --calc and --eval)
 // ===========================================================================
 
 type evaluator struct {
 	cells    map[string]*cellCmd
 	cache    map[string]*big.Rat
 	visiting map[string]bool
+}
+
+// evalExpression loads a file (either .sc or .csv, detected by extension),
+// evaluates the given expression, and prints the result to stdout.
+//
+// This is the headless formula evaluator. It supports both .sc and .csv
+// files, so you can evaluate formulas against a CSV without converting it
+// to .sc first.
+func evalExpression(filename, expr string, precision int) error {
+	ext := strings.ToLower(filepath.Ext(filename))
+
+	var cells map[string]*cellCmd
+
+	switch ext {
+	case ".csv", ".tsv":
+		var err error
+		cells, err = loadCSV(filename)
+		if err != nil {
+			return err
+		}
+	case ".sc", ".txt", "":
+		var err error
+		cells, err = loadSC(filename)
+		if err != nil {
+			return err
+		}
+	default:
+		// Try sc first, then csv.
+		var err error
+		cells, err = loadSC(filename)
+		if err != nil {
+			cells, err = loadCSV(filename)
+			if err != nil {
+				return fmt.Errorf("could not load %q as sc or csv: %v", filename, err)
+			}
+		}
+	}
+
+	eval := &evaluator{cells: cells, cache: make(map[string]*big.Rat), visiting: make(map[string]bool)}
+
+	expr = strings.TrimPrefix(expr, "=")
+
+	if scAddrRx.MatchString(expr) {
+		rat, err := eval.evalCell(expr)
+		if err != nil {
+			return err
+		}
+		fmt.Println(rat.FloatString(precision))
+		return nil
+	}
+
+	rat, err := eval.evalFormula(expr)
+	if err != nil {
+		return err
+	}
+	fmt.Println(rat.FloatString(precision))
+	return nil
+}
+
+// loadSC loads an .sc file into a map of cellCmd.
+func loadSC(filename string) (map[string]*cellCmd, error) {
+	f, err := os.Open(filename)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+
+	cells := make(map[string]*cellCmd)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		m := scCmdRx.FindStringSubmatch(line)
+		if m == nil {
+			continue
+		}
+		cmd, addr, val := m[1], m[2], m[3]
+
+		if cmd == "let" {
+			if isNumeric(val) {
+				cells[addr] = &cellCmd{kindNumber, addr, val}
+			} else {
+				cells[addr] = &cellCmd{kindFormula, addr, val}
+			}
+			continue
+		}
+		if len(val) >= 2 && val[0] == '"' && val[len(val)-1] == '"' {
+			val = val[1 : len(val)-1]
+			val = unescapeString(val)
+		}
+		cells[addr] = &cellCmd{kindString, addr, val}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return cells, nil
+}
+
+// loadCSV loads a .csv file into a map of cellCmd.
+//
+// The first row is treated as a header (strings), unless it contains
+// only numeric values (in which case it is treated as data).
+func loadCSV(filename string) (map[string]*cellCmd, error) {
+	f, err := os.Open(filename)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	reader := csv.NewReader(f)
+	reader.LazyQuotes = true
+	reader.FieldsPerRecord = -1
+	reader.TrimLeadingSpace = true
+
+	cells := make(map[string]*cellCmd)
+	row := 0
+	for {
+		record, err := reader.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		for col, field := range record {
+			if field == "" {
+				continue
+			}
+			addr := address(row, col)
+			if isNumeric(field) {
+				cells[addr] = &cellCmd{kindNumber, addr, field}
+			} else if strings.HasPrefix(field, "=") {
+				cells[addr] = &cellCmd{kindFormula, addr, strings.TrimPrefix(field, "=")}
+			} else {
+				cells[addr] = &cellCmd{kindString, addr, field}
+			}
+		}
+		row++
+	}
+	return cells, nil
 }
 
 func (e *evaluator) evalCell(addr string) (*big.Rat, error) {
@@ -464,10 +646,6 @@ func (v value) asSingle() *big.Rat {
 	return sum
 }
 
-// tokenizeFormula converts a formula string into a list of tokens.
-//
-// Functions (@sum, @avg, @max, @min) are tokenized as postfix: their
-// arguments are emitted first, then the function token.
 func tokenizeFormula(expr string) []string {
 	var tokens []string
 	i := 0
