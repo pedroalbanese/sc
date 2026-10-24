@@ -40,6 +40,7 @@ This release adds support for cell ranges (A1:A7).
 ### Added
 - **Cell ranges:** support for ranges such as `A1:A7` in formulas (e.g., `A1:A7*2`, `B1:B3+C1:C3`).
 - **Functions:** `@sum`, `@avg`, `@max` and `@min` now work with cell ranges (e.g., `@avg(B1:D1)`, `@max(A1:A7)`).
+- **Cross-spreadsheet evaluation:** `@eval("file", "expr")` and `@evaler("file", "expr")` evaluate expressions against external `.sc`, `.csv`, or `.tsv` files.
 - **Delete row/column:** press `d` followed by `r` (row) or `c` (column) to delete the current row or column. Formulas are adjusted automatically: references to the deleted row/column become `@ERR`, references to rows/columns to the right are decremented, and ranges are shrunk accordingly.
 - **Undo:** press `u` to revert the most recent cell change (single-level undo).
 - **GoTo:** press `g`, type an address (e.g., `C5`), and press Enter to jump directly to that cell.
