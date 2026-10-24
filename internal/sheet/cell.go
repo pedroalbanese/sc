@@ -47,7 +47,11 @@ func (c *Cell) Copy(oldAddress, newAddress Address) *Cell {
 }
 
 func (c *Cell) getDisplayValue(s *Sheet, address Address) string {
-	if c.cacheValid {
+	// Cells that use @evaler are never cached, because the external
+	// file may have changed since the last calculation.
+	isExternal := strings.Contains(c.value, "@evaler(")
+
+	if c.cacheValid && !isExternal {
 		return c.cachedValue
 	}
 	if c.calculating {
@@ -69,10 +73,26 @@ func (c *Cell) getDisplayValue(s *Sheet, address Address) string {
 	currentSheet = s
 	defer func() { currentSheet = prevSheet }()
 
+	// Handle @evaler(filename, expr) directly.
+	if rat, ok := c.evalExternalCall(); ok {
+		if rat == nil {
+			if !isExternal {
+				c.cachedValue = "INVALID"
+				c.cacheValid = true
+			}
+			return "INVALID"
+		}
+		result := rat.FloatString(s.getPrecision(address))
+		if !isExternal {
+			c.cachedValue = result
+			c.cacheValid = true
+		}
+		return result
+	}
+
 	postfix := evaler.GetPostfix(c.value)
 
-	// Check if the postfix contains @ERR. If it does, skip propagation
-	// (the @ERR will be handled by EvaluatePostfix, returning ErrRef).
+	// Check if the postfix contains @ERR. If it does, skip propagation.
 	hasErr := false
 	for _, token := range postfix {
 		if token == "@ERR" {
@@ -89,19 +109,25 @@ func (c *Cell) getDisplayValue(s *Sheet, address Address) string {
 			if cell, err := s.GetCell(Address(token)); err == nil && cell != nil {
 				v := cell.getDisplayValue(s, Address(token))
 				if v == "circle" {
-					c.cachedValue = "circle"
-					c.cacheValid = true
+					if !isExternal {
+						c.cachedValue = "circle"
+						c.cacheValid = true
+					}
 					return "circle"
 				}
 				if !hasErr {
 					if v == "ERROR" {
-						c.cachedValue = "INVALID"
-						c.cacheValid = true
+						if !isExternal {
+							c.cachedValue = "INVALID"
+							c.cacheValid = true
+						}
 						return "INVALID"
 					}
 					if v == "INVALID" {
-						c.cachedValue = "INVALID"
-						c.cacheValid = true
+						if !isExternal {
+							c.cachedValue = "INVALID"
+							c.cacheValid = true
+						}
 						return "INVALID"
 					}
 				}
@@ -121,9 +147,92 @@ func (c *Cell) getDisplayValue(s *Sheet, address Address) string {
 	} else {
 		result = "INVALID"
 	}
-	c.cachedValue = result
-	c.cacheValid = true
+	if !isExternal {
+		c.cachedValue = result
+		c.cacheValid = true
+	}
 	return result
+}
+
+// evalExternalCall checks if the cell's formula is an @evaler(...) call.
+// If so, it evaluates the expression against the external file and
+// returns the result. If the formula is not an @evaler call, it returns
+// (nil, false).
+//
+// The syntax is: @evaler("filename", "expression")
+// The quotes around the filename and expression are optional.
+func (c *Cell) evalExternalCall() (*big.Rat, bool) {
+	expr := strings.TrimSpace(c.value)
+	if !strings.HasPrefix(expr, "@evaler(") {
+		return nil, false
+	}
+	if !strings.HasSuffix(expr, ")") {
+		return nil, true // malformed, but it's an @evaler call
+	}
+
+	// Extract the arguments inside the parentheses.
+	inner := strings.TrimSuffix(strings.TrimPrefix(expr, "@evaler("), ")")
+
+	// Split on the first top-level comma.
+	parts := splitTopLevel(inner, ',')
+	if len(parts) != 2 {
+		return nil, true
+	}
+
+	filename := strings.TrimSpace(parts[0])
+	filename = strings.Trim(filename, `"'`)
+	subExpr := strings.TrimSpace(parts[1])
+	subExpr = strings.Trim(subExpr, `"'`)
+
+	rat, err := evaler.EvalExternal(filename, subExpr)
+	if err != nil {
+		return nil, true
+	}
+	return rat, true
+}
+
+// splitTopLevel splits a string on a separator, ignoring separators
+// inside parentheses or quotes.
+func splitTopLevel(s string, sep rune) []string {
+	var out []string
+	var cur strings.Builder
+	depth := 0
+	inSingle, inDouble := false, false
+	for _, c := range s {
+		switch c {
+		case '(':
+			if !inSingle && !inDouble {
+				depth++
+			}
+			cur.WriteRune(c)
+		case ')':
+			if !inSingle && !inDouble {
+				depth--
+			}
+			cur.WriteRune(c)
+		case '\'':
+			if !inDouble {
+				inSingle = !inSingle
+			}
+			cur.WriteRune(c)
+		case '"':
+			if !inSingle {
+				inDouble = !inDouble
+			}
+			cur.WriteRune(c)
+		case sep:
+			if depth == 0 && !inSingle && !inDouble {
+				out = append(out, cur.String())
+				cur.Reset()
+			} else {
+				cur.WriteRune(c)
+			}
+		default:
+			cur.WriteRune(c)
+		}
+	}
+	out = append(out, cur.String())
+	return out
 }
 
 // expandRangeList expands a range like A1:B3 into a list of cell values.
