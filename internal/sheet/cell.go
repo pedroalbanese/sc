@@ -92,15 +92,6 @@ func (c *Cell) getDisplayValue(s *Sheet, address Address) string {
 
 	postfix := evaler.GetPostfix(c.value)
 
-	// Check if the postfix contains @ERR. If it does, skip propagation.
-	hasErr := false
-	for _, token := range postfix {
-		if token == "@ERR" {
-			hasErr = true
-			break
-		}
-	}
-
 	// Substitute cell addresses with their values. Ranges are left as
 	// tokens; the evaler expands them via RangeExpander.
 	for idx, token := range postfix {
@@ -115,23 +106,21 @@ func (c *Cell) getDisplayValue(s *Sheet, address Address) string {
 					}
 					return "circle"
 				}
-				if !hasErr {
-					if v == "ERROR" {
-						if !isExternal {
-							c.cachedValue = "INVALID"
-							c.cacheValid = true
-						}
-						return "INVALID"
+				if v == "ERROR" {
+					if !isExternal {
+						c.cachedValue = "INVALID"
+						c.cacheValid = true
 					}
-					if v == "INVALID" {
-						if !isExternal {
-							c.cachedValue = "INVALID"
-							c.cacheValid = true
-						}
-						return "INVALID"
-					}
+					return "INVALID"
 				}
-				if v != "" && v != "ERROR" && v != "INVALID" {
+				if v == "INVALID" {
+					if !isExternal {
+						c.cachedValue = "INVALID"
+						c.cacheValid = true
+					}
+					return "INVALID"
+				}
+				if v != "" {
 					refCellVal = v
 				}
 			}
@@ -237,6 +226,9 @@ func splitTopLevel(s string, sep rune) []string {
 
 // expandRangeList expands a range like A1:B3 into a list of cell values.
 // Used by the evaler's RangeExpander.
+//
+// If any cell in the range does not exist (was deleted), the whole
+// range returns INVALID, matching the original sc behavior.
 func (s *Sheet) expandRangeList(rng string) []string {
 	parts := strings.SplitN(rng, ":", 2)
 	if len(parts) != 2 {
@@ -259,12 +251,19 @@ func (s *Sheet) expandRangeList(rng string) []string {
 		for c := c1; c <= c2; c++ {
 			addr := NewAddress(r, c)
 			cell, err := s.GetCell(addr)
-			if err != nil || cell == nil || cell.stringType {
+			if err != nil || cell == nil {
+				// Cell inside a range does not exist → INVALID.
+				return []string{"INVALID"}
+			}
+			if cell.stringType {
 				continue
 			}
 			v := cell.getDisplayValue(s, addr)
+			if v == "ERROR" || v == "INVALID" {
+				return []string{"INVALID"}
+			}
 			if v == "circle" {
-				return []string{"0"}
+				return []string{"circle"}
 			}
 			if v == "" {
 				v = "0"
@@ -309,6 +308,9 @@ func (c *Cell) StatusBarVal() string {
 // expandRange sums a range like A1:B3. Used only for formulas without
 // functions; when a function is present, the evaler expands the range
 // into individual values via RangeExpander.
+//
+// If any cell in the range does not exist (was deleted), the whole
+// range returns INVALID, matching the original sc behavior.
 func (s *Sheet) expandRange(rng string) string {
 	parts := strings.SplitN(rng, ":", 2)
 	if len(parts) != 2 {
@@ -324,12 +326,18 @@ func (s *Sheet) expandRange(rng string) string {
 		for c := c1; c <= c2; c++ {
 			addr := NewAddress(r, c)
 			cell, err := s.GetCell(addr)
-			if err != nil || cell == nil || cell.stringType {
+			if err != nil || cell == nil {
+				return "INVALID"
+			}
+			if cell.stringType {
 				continue
 			}
 			valStr := cell.getDisplayValue(s, addr)
 			if valStr == "circle" {
 				return "circle"
+			}
+			if valStr == "ERROR" || valStr == "INVALID" {
+				return "INVALID"
 			}
 			if valStr == "" {
 				continue
