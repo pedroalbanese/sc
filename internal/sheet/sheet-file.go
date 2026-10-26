@@ -54,6 +54,13 @@ func (s *Sheet) Load() {
 			}
 		}
 		s.loading = false
+		file.Close()
+	}
+
+	// Invalidate all caches after loading, so that cells are recalculated
+	// in the correct order on the next display.
+	for _, cell := range s.data {
+		cell.cacheValid = false
 	}
 }
 
