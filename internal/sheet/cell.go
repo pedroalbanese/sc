@@ -83,7 +83,13 @@ func (c *Cell) getDisplayValue(s *Sheet, address Address) string {
 			return "INVALID"
 		}
 		result := rat.FloatString(s.getPrecision(address))
-		if !isExternal {
+
+		// If the external value changed, invalidate dependents.
+		if result != c.cachedValue {
+			c.cachedValue = result
+			c.cacheValid = true
+			s.invalidateCache(address)
+		} else if !isExternal {
 			c.cachedValue = result
 			c.cacheValid = true
 		}
